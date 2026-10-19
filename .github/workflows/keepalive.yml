@@ -1,4 +1,5 @@
 name: box-keepalive
+# schedule re-registration kickstart 2026-10-19
 
 on:
   schedule:
