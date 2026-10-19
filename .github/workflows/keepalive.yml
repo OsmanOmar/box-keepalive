@@ -3,7 +3,7 @@ name: box-keepalive
 
 on:
   schedule:
-    - cron: "7,37 * * * *"
+    - cron: "13,43 * * * *"
   workflow_dispatch:
 
 permissions:
