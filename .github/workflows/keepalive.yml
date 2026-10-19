@@ -2,12 +2,18 @@ name: box-keepalive
 
 on:
   schedule:
-    # Run every 10 minutes on off-peak minutes to avoid GitHub Actions queue spikes
+    # Backup safety net (every 10 minutes on off-peak minutes)
     - cron: "4,14,24,34,44,54 * * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode: "relay" (autonomous cloud relay) or "single" (single heartbeat)'
+        required: false
+        default: 'relay'
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: box-keepalive
@@ -16,36 +22,78 @@ concurrency:
 jobs:
   beat:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - name: Heartbeat / wake machine
+      - name: Heartbeat and Autonomous Cloud Relay
         env:
           KEY: ${{ secrets.INSTABOX_API_KEY }}
           MID: m_agqvewnk3b3qhjidng5ktd2co4
+          GH_PAT: ${{ secrets.GH_PAT }}
+          MODE: ${{ github.event.inputs.mode || 'relay' }}
         run: |
           set -euo pipefail
-          echo "[$(date -u +%FT%TZ)] Sending heartbeat to InstaBox machine $MID..."
-          BEAT=$(curl -sS -m 100 -X POST             -H "X-API-Key: $KEY" -H "Content-Type: application/json"             -d '{"cmd":"true"}'             "https://api.instabox.sh/v1/machines/$MID/exec" || echo '{"error":{"code":"curl_failed"}}')
-          echo "beat result: $BEAT"
-          if echo "$BEAT" | grep -q machine_not_running; then
-            echo "Machine is suspended! Triggering POST /start..."
-            curl -sS -m 60 -X POST               -H "X-API-Key: $KEY" -H "Idempotency-Key: wake-$GITHUB_RUN_ID"               "https://api.instabox.sh/v1/machines/$MID/start"
-            echo "start accepted; waiting 20s for VM resume..."
-            sleep 20
-            V=$(curl -sS -m 100 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json"               -d '{"cmd":"true"}' "https://api.instabox.sh/v1/machines/$MID/exec")
-            echo "verify result: $V"
-            if echo "$V" | grep -q machine_not_running; then
-              echo "Failed to wake machine!"
-              exit 1
+
+          send_beat() {
+            local step_name="$1"
+            echo "--------------------------------------------------------"
+            echo "[$(date -u +%FT%TZ)] [Step: $step_name] Pinging InstaBox VM ($MID)..."
+            
+            BEAT=$(curl -sS -m 60 -X POST               -H "X-API-Key: $KEY"               -H "Content-Type: application/json"               -d '{"cmd":"true"}'               "https://api.instabox.sh/v1/machines/$MID/exec" || echo '{"error":{"code":"curl_failed"}}')
+            
+            echo "Exec response: $BEAT"
+            
+            if echo "$BEAT" | grep -q "machine_not_running"; then
+              echo "Machine is suspended! Triggering POST /start..."
+              curl -sS -m 60 -X POST                 -H "X-API-Key: $KEY"                 -H "Idempotency-Key: wake-$GITHUB_RUN_ID-$(date +%s)"                 "https://api.instabox.sh/v1/machines/$MID/start"
+              echo "Start accepted, waiting 20s for resume..."
+              sleep 20
+              
+              V=$(curl -sS -m 60 -X POST                 -H "X-API-Key: $KEY"                 -H "Content-Type: application/json"                 -d '{"cmd":"true"}'                 "https://api.instabox.sh/v1/machines/$MID/exec" || echo '{"error":{"code":"verify_failed"}}')
+              echo "Verify response: $V"
+              if echo "$V" | grep -q "machine_not_running"; then
+                echo "ERROR: Machine failed to wake up!"
+                exit 1
+              fi
+              echo "SUCCESS: Machine resumed and running!"
+            elif echo "$BEAT" | grep -q '"exitCode"'; then
+              echo "SUCCESS: Machine is running and healthy (idle timer reset)."
+            else
+              echo "WARNING: Unexpected response: $BEAT"
             fi
-            echo "Machine successfully woken up!"
-          elif ! echo "$BEAT" | grep -q '"exitCode"'; then
-            echo "unexpected beat response: $BEAT"
-            exit 1
+          }
+
+          # Beat 1 (Minute 0)
+          send_beat "Beat-1 (0m)"
+
+          if [ "$MODE" = "single" ]; then
+            echo "Single mode requested. Exiting without relay."
+            exit 0
+          fi
+
+          # Relay cycle: 2 intermediate sleeps of 10 min
+          echo "Entering Relay Mode. Sleeping 10 minutes (600s)..."
+          sleep 600
+
+          # Beat 2 (Minute 10)
+          send_beat "Beat-2 (10m)"
+
+          echo "Sleeping 10 minutes (600s)..."
+          sleep 600
+
+          # Beat 3 (Minute 20)
+          send_beat "Beat-3 (20m)"
+
+          # Baton handover: Dispatch the next relay run
+          echo "Dispatching next relay run via GitHub API..."
+          DISPATCH_RES=$(curl -sS -w "%{http_code}" -o /dev/null -X POST             -H "Authorization: Bearer $GH_PAT"             -H "Accept: application/vnd.github+json"             -H "User-Agent: box-keepalive-relay"             "https://api.github.com/repos/OsmanOmar/box-keepalive/actions/workflows/keepalive.yml/dispatches"             -d '{"ref":"main","inputs":{"mode":"relay"}}')
+
+          echo "Dispatch response HTTP code: $DISPATCH_RES"
+          if [ "$DISPATCH_RES" -eq 204 ]; then
+            echo "Baton handover succeeded! Next run queued in GitHub Actions."
           else
-            echo "Machine is healthy and running."
+            echo "WARNING: Dispatch returned $DISPATCH_RES"
           fi
 
       - name: Daily self-commit (keep repo active)
@@ -62,6 +110,7 @@ jobs:
             git add .last-beat
             git commit -m "beat $TODAY"
             git push
+            echo "Daily self-commit pushed."
           else
-            echo "already committed today"
+            echo "Already committed today ($TODAY)."
           fi
