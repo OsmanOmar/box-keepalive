@@ -1,9 +1,9 @@
 name: box-keepalive
-# schedule re-registration kickstart 2026-10-19
 
 on:
   schedule:
-    - cron: "13,43 * * * *"
+    # Run every 10 minutes on off-peak minutes to avoid GitHub Actions queue spikes
+    - cron: "4,14,24,34,44,54 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -26,22 +26,26 @@ jobs:
           MID: m_agqvewnk3b3qhjidng5ktd2co4
         run: |
           set -euo pipefail
+          echo "[$(date -u +%FT%TZ)] Sending heartbeat to InstaBox machine $MID..."
           BEAT=$(curl -sS -m 100 -X POST             -H "X-API-Key: $KEY" -H "Content-Type: application/json"             -d '{"cmd":"true"}'             "https://api.instabox.sh/v1/machines/$MID/exec" || echo '{"error":{"code":"curl_failed"}}')
-          echo "beat: $BEAT"
+          echo "beat result: $BEAT"
           if echo "$BEAT" | grep -q machine_not_running; then
-            echo "suspended -> starting"
+            echo "Machine is suspended! Triggering POST /start..."
             curl -sS -m 60 -X POST               -H "X-API-Key: $KEY" -H "Idempotency-Key: wake-$GITHUB_RUN_ID"               "https://api.instabox.sh/v1/machines/$MID/start"
-            echo "start accepted; verifying in 20s"
+            echo "start accepted; waiting 20s for VM resume..."
             sleep 20
             V=$(curl -sS -m 100 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json"               -d '{"cmd":"true"}' "https://api.instabox.sh/v1/machines/$MID/exec")
-            echo "verify: $V"
+            echo "verify result: $V"
             if echo "$V" | grep -q machine_not_running; then
-              echo "start failed"
+              echo "Failed to wake machine!"
               exit 1
             fi
+            echo "Machine successfully woken up!"
           elif ! echo "$BEAT" | grep -q '"exitCode"'; then
-            echo "unexpected beat response"
+            echo "unexpected beat response: $BEAT"
             exit 1
+          else
+            echo "Machine is healthy and running."
           fi
 
       - name: Daily self-commit (keep repo active)
