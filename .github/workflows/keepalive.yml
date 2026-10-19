@@ -1,0 +1,62 @@
+name: box-keepalive
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: box-keepalive
+  cancel-in-progress: false
+
+jobs:
+  beat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Heartbeat / wake machine
+        env:
+          KEY: ${{ secrets.INSTABOX_API_KEY }}
+          MID: m_agqvewnk3b3qhjidng5ktd2co4
+        run: |
+          set -euo pipefail
+          BEAT=$(curl -sS -m 100 -X POST             -H "X-API-Key: $KEY" -H "Content-Type: application/json"             -d '{"cmd":"true"}'             "https://api.instabox.sh/v1/machines/$MID/exec" || echo '{"error":{"code":"curl_failed"}}')
+          echo "beat: $BEAT"
+          if echo "$BEAT" | grep -q machine_not_running; then
+            echo "suspended -> starting"
+            curl -sS -m 60 -X POST               -H "X-API-Key: $KEY" -H "Idempotency-Key: wake-$GITHUB_RUN_ID"               "https://api.instabox.sh/v1/machines/$MID/start"
+            echo "start accepted; verifying in 20s"
+            sleep 20
+            V=$(curl -sS -m 100 -X POST -H "X-API-Key: $KEY" -H "Content-Type: application/json"               -d '{"cmd":"true"}' "https://api.instabox.sh/v1/machines/$MID/exec")
+            echo "verify: $V"
+            if echo "$V" | grep -q machine_not_running; then
+              echo "start failed"
+              exit 1
+            fi
+          elif ! echo "$BEAT" | grep -q '"exitCode"'; then
+            echo "unexpected beat response"
+            exit 1
+          fi
+
+      - name: Daily self-commit (keep repo active)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TODAY=$(date -u +%F)
+          LAST=$(cat .last-beat 2>/dev/null || echo none)
+          if [ "$TODAY" != "$LAST" ]; then
+            echo "$TODAY" > .last-beat
+            git config user.name "keepalive-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .last-beat
+            git commit -m "beat $TODAY"
+            git push
+          else
+            echo "already committed today"
+          fi
